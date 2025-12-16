@@ -25,13 +25,13 @@ int main(void) {
         step_single(&cpu);
     }
 
-    printf("\n--- Pipeline test (no hazards yet) ---\n");
+    printf("\n--- Pipeline test  ---\n");
     PipeCpu pcpu;
 
     load_single_block_program();  // reuse same program + data
     init_pipe_cpu(&pcpu);
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 12; i++) {
         print_pipe_state(&pcpu);
         step_pipe(&pcpu);
     }

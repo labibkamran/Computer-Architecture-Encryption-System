@@ -12,6 +12,23 @@ static int is_nop_instr(uint16_t raw) {
     return ((raw >> 12) & 0xF) == OPC_NOP;
 }
 
+static bool writes_reg(DecodedInstr d) {
+    switch (d.opcode) {
+        case OPC_LD:
+        case OPC_ADDI:
+        case OPC_ENC:
+        case OPC_DEC:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static uint8_t dest_reg(DecodedInstr d) {
+    return d.f1;
+}
+
+
 // ---- Initialisation ----
 void init_pipe_cpu(PipeCpu *cpu) {
     // reset architectural state (regs, keys, PC)
@@ -153,23 +170,69 @@ void step_pipe(PipeCpu *cpu) {
         case OPC_LD:
         case OPC_ST:
         case OPC_ADDI: {
+            /* Forward base register from EX/MEM or MEM/WB when needed */
+            uint8_t rs = prev_id.d.f2;
             uint16_t base = prev_id.rs_val;
+            if ((cpu->ex_mem.d.opcode == OPC_ADDI || cpu->ex_mem.d.opcode == OPC_ENC || cpu->ex_mem.d.opcode == OPC_DEC || cpu->ex_mem.d.opcode == OPC_LD) && cpu->ex_mem.d.f1 == rs) {
+                base = cpu->ex_mem.alu_result;
+            } else if ((cpu->mem_wb.d.opcode == OPC_LD || cpu->mem_wb.d.opcode == OPC_ADDI || cpu->mem_wb.d.opcode == OPC_ENC || cpu->mem_wb.d.opcode == OPC_DEC) && cpu->mem_wb.d.f1 == rs) {
+                base = cpu->mem_wb.write_val;
+            }
+
             next_ex.alu_result = (uint16_t)(base + prev_id.d.imm6);
+            /* For ST we may forward store data below */
+            if (prev_id.d.opcode == OPC_ST) {
+                /* placeholder: rs2 will be set after switch for ST */
+            }
             break;
         }
         case OPC_LDK: {
+            uint8_t rs = prev_id.d.f2;
             uint16_t base = prev_id.rs_val;
+            if ((cpu->ex_mem.d.opcode == OPC_ADDI || cpu->ex_mem.d.opcode == OPC_ENC || cpu->ex_mem.d.opcode == OPC_DEC || cpu->ex_mem.d.opcode == OPC_LD) && cpu->ex_mem.d.f1 == rs) {
+                base = cpu->ex_mem.alu_result;
+            } else if ((cpu->mem_wb.d.opcode == OPC_LD || cpu->mem_wb.d.opcode == OPC_ADDI || cpu->mem_wb.d.opcode == OPC_ENC || cpu->mem_wb.d.opcode == OPC_DEC) && cpu->mem_wb.d.f1 == rs) {
+                base = cpu->mem_wb.write_val;
+            }
             next_ex.alu_result = (uint16_t)(base + prev_id.d.imm6); // EA
             break;
         }
         case OPC_ENC: {
+            /* Forward ENC operand from EX/MEM or MEM/WB */
+            uint8_t rs = prev_id.d.f2;
             uint16_t in = prev_id.rs_val;
-            next_ex.alu_result = enc_func(in, cpu->core.K0, cpu->core.K1);
+            if ((cpu->ex_mem.d.opcode == OPC_ADDI || cpu->ex_mem.d.opcode == OPC_ENC || cpu->ex_mem.d.opcode == OPC_DEC || cpu->ex_mem.d.opcode == OPC_LD) && cpu->ex_mem.d.f1 == rs) {
+                in = cpu->ex_mem.alu_result;
+            } else if ((cpu->mem_wb.d.opcode == OPC_LD || cpu->mem_wb.d.opcode == OPC_ADDI || cpu->mem_wb.d.opcode == OPC_ENC || cpu->mem_wb.d.opcode == OPC_DEC) && cpu->mem_wb.d.f1 == rs) {
+                in = cpu->mem_wb.write_val;
+            }
+
+            /* Forward keys from MEM/WB if LDK just completed there */
+            uint16_t k0 = cpu->core.K0;
+            uint16_t k1 = cpu->core.K1;
+            if (cpu->mem_wb.d.opcode == OPC_LDK) {
+                if (cpu->mem_wb.d.f1 == 6) k0 = cpu->mem_wb.write_val;
+                else if (cpu->mem_wb.d.f1 == 7) k1 = cpu->mem_wb.write_val;
+            }
+            next_ex.alu_result = enc_func(in, k0, k1);
             break;
         }
         case OPC_DEC: {
+            /* Similar forwarding for DEC */
+            uint8_t rs = prev_id.d.f2;
             uint16_t in = prev_id.rs_val;
-            next_ex.alu_result = dec_func(in, cpu->core.K0, cpu->core.K1);
+            if ((cpu->ex_mem.d.opcode == OPC_ADDI || cpu->ex_mem.d.opcode == OPC_ENC || cpu->ex_mem.d.opcode == OPC_DEC || cpu->ex_mem.d.opcode == OPC_LD) && cpu->ex_mem.d.f1 == rs) {
+                in = cpu->ex_mem.alu_result;
+            } else if ((cpu->mem_wb.d.opcode == OPC_LD || cpu->mem_wb.d.opcode == OPC_ADDI || cpu->mem_wb.d.opcode == OPC_ENC || cpu->mem_wb.d.opcode == OPC_DEC) && cpu->mem_wb.d.f1 == rs) {
+                in = cpu->mem_wb.write_val;
+            }
+            uint16_t k0 = cpu->core.K0;
+            uint16_t k1 = cpu->core.K1;
+            if (cpu->mem_wb.d.opcode == OPC_LDK) {
+                if (cpu->mem_wb.d.f1 == 6) k0 = cpu->mem_wb.write_val;
+                else if (cpu->mem_wb.d.f1 == 7) k1 = cpu->mem_wb.write_val;
+            }
+            next_ex.alu_result = dec_func(in, k0, k1);
             break;
         }
         case OPC_BNE: {
@@ -183,6 +246,18 @@ void step_pipe(PipeCpu *cpu) {
             break;
     }
 
+    /* For ST, forward store data if a recent instruction produces it */
+    if (prev_id.d.opcode == OPC_ST) {
+        uint8_t rt = prev_id.d.f1;
+        uint16_t store_data = prev_id.rs2_val;
+        if ((cpu->ex_mem.d.opcode == OPC_ADDI || cpu->ex_mem.d.opcode == OPC_ENC || cpu->ex_mem.d.opcode == OPC_DEC || cpu->ex_mem.d.opcode == OPC_LD) && cpu->ex_mem.d.f1 == rt) {
+            store_data = cpu->ex_mem.alu_result;
+        } else if ((cpu->mem_wb.d.opcode == OPC_LD || cpu->mem_wb.d.opcode == OPC_ADDI || cpu->mem_wb.d.opcode == OPC_ENC || cpu->mem_wb.d.opcode == OPC_DEC || cpu->mem_wb.d.opcode == OPC_LDK) && cpu->mem_wb.d.f1 == rt) {
+            store_data = cpu->mem_wb.write_val;
+        }
+        next_ex.rs2_val = store_data;
+    }
+
     // Update PC if branch taken (no flush logic yet)
     if (next_ex.branch_taken) {
         cpu->core.PC = next_ex.branch_target;
@@ -190,41 +265,95 @@ void step_pipe(PipeCpu *cpu) {
 
     cpu->ex_mem = next_ex;
 
-    // -------------------------------
-    // 4. ID stage (IF_ID -> ID_EX)
-    // -------------------------------
+    // HAZARD DETECTION
+    bool stall = false;
+
+    DecodedInstr ex  = cpu->id_ex.d;
+    DecodedInstr mem = cpu->ex_mem.d;
     IF_ID prev_if = cpu->if_id;
     ID_EX next_id;
     next_id.pc = prev_if.pc;
 
-    if (is_nop_instr(prev_if.instr)) {
-        next_id.d.opcode = OPC_NOP;
-        next_id.d.f1 = next_id.d.f2 = next_id.d.f3 = 0;
-        next_id.d.imm6 = 0;
-        next_id.rs_val = 0;
-        next_id.rs2_val = 0;
-    } else {
-        DecodedInstr d = decode(prev_if.instr);
-        next_id.d = d;
+    if (!is_nop_instr(prev_if.instr)) {
+        DecodedInstr id = decode(prev_if.instr);
+        uint8_t id_rs1 = id.f2;
+        uint8_t id_rs2 = id.f3;
 
-        uint8_t rs  = d.f2;
-        uint8_t rs2 = d.f3;   // used for BNE/ST when needed
+        // EX stage is a LD producing a register needed by ID -> stall
+        if (ex.opcode == OPC_LD) {
+            uint8_t ex_rd = ex.f1;
+            if (ex_rd == id_rs1 || ex_rd == id_rs2) {
+                stall = true;
+            }
+        }
 
-        next_id.rs_val  = cpu->core.R[rs];
-        next_id.rs2_val = cpu->core.R[rs2];
+        // if LDK is in EX and ID is ENC/DEC, stall until LDK reaches MEM
+        if ((id.opcode == OPC_ENC || id.opcode == OPC_DEC) && ex.opcode == OPC_LDK) {
+            stall = true;
+        }
+
+        // if ID is ST and its rt will be produced by an instruction currently in EX,
+        //  stall; forward from EX/MEM or MEM/WB is allowed (no stall) because we read forwarded value at ID time.
+        if (id.opcode == OPC_ST) {
+            uint8_t rt = id.f1;
+            if (writes_reg(ex) && dest_reg(ex) == rt) {
+                stall = true;
+            }
+        }
     }
 
-    cpu->id_ex = next_id;
+    // -------------------------------
+    // 4. ID stage (IF_ID -> ID_EX)
+    // -------------------------------
+
+    if (stall) {
+        cpu->id_ex.d.opcode = OPC_NOP;
+        cpu->id_ex.rs_val  = 0;
+        cpu->id_ex.rs2_val = 0;
+    } else {
+        if (is_nop_instr(prev_if.instr)) {
+            next_id.d.opcode = OPC_NOP;
+            next_id.rs_val  = 0;
+            next_id.rs2_val = 0;
+        } else {
+            DecodedInstr d = decode(prev_if.instr);
+            next_id.d = d;
+
+            uint8_t rs  = d.f2;
+            //  For ST, rs2_val holds the store data (rt = f1) 
+            if (d.opcode == OPC_ST) {
+                next_id.rs_val  = cpu->core.R[rs];
+                uint8_t rt = d.f1;
+                // Forward store data at ID time from EX/MEM or MEM/WB if available 
+                if ((cpu->ex_mem.d.opcode == OPC_ADDI || cpu->ex_mem.d.opcode == OPC_ENC || cpu->ex_mem.d.opcode == OPC_DEC || cpu->ex_mem.d.opcode == OPC_LD) && cpu->ex_mem.d.f1 == rt) {
+                    next_id.rs2_val = cpu->ex_mem.alu_result;
+                } else if ((cpu->mem_wb.d.opcode == OPC_LD || cpu->mem_wb.d.opcode == OPC_ADDI || cpu->mem_wb.d.opcode == OPC_ENC || cpu->mem_wb.d.opcode == OPC_DEC || cpu->mem_wb.d.opcode == OPC_LDK) && cpu->mem_wb.d.f1 == rt) {
+                    next_id.rs2_val = cpu->mem_wb.write_val;
+                } else {
+                    next_id.rs2_val = cpu->core.R[rt];
+                }
+            } else {
+                uint8_t rs2 = d.f3;
+                next_id.rs_val  = cpu->core.R[rs];
+                next_id.rs2_val = cpu->core.R[rs2];
+            }
+        }
+        cpu->id_ex = next_id;
+    }
+
+
+
 
     // -------------------------------
-    // 5. IF stage (fetch new instruction)
+    // 5. IF stage
     // -------------------------------
     IF_ID next_if;
     next_if.pc    = cpu->core.PC;
     next_if.instr = instr_mem[cpu->core.PC];
 
-    // default PC increment (may be overridden by branch above)
-    cpu->core.PC++;
+    if (!stall) {
+        cpu->if_id = next_if;
+        cpu->core.PC++;
+    }
 
-    cpu->if_id = next_if;
 }
