@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CA-Enc-Sys Trace Viewer</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --accent: #22d3ee;
+      --muted: #94a3b8;
+      --text: #e2e8f0;
+      --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", sans-serif;
+      background: radial-gradient(circle at 20% 20%, #1e293b, #0f172a 60%);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      padding: 16px 24px;
+      background: linear-gradient(90deg, #14b8a6, #22d3ee);
+      color: #0f172a;
+      font-weight: 700;
+      font-size: 20px;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    main { padding: 16px 24px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid #1f2937;
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.25);
+    }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .col { flex: 1 1 280px; }
+    label { font-weight: 600; display: block; margin-bottom: 6px; color: var(--muted); }
+    select, input[type="file"] {
+      background: #0b1220; border: 1px solid #1f2937; color: var(--text);
+      padding: 8px 10px; border-radius: 6px; width: 100%;
+    }
+    button {
+      background: var(--accent); color: #0f172a; border: none;
+      padding: 9px 14px; border-radius: 6px; font-weight: 700; cursor: pointer;
+    }
+    button:hover { filter: brightness(1.05); }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit,minmax(160px,1fr)); gap: 8px; }
+    .metric { background: #0b1220; padding: 10px; border-radius: 8px; border: 1px solid #1f2937; }
+    .metric .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .metric .value { font-size: 18px; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border: 1px solid #1f2937; padding: 6px 8px; text-align: left; }
+    th { background: #0b1220; color: var(--muted); font-weight: 600; }
+    .stage-row td { background: #0f172a; }
+    .small { font-size: 12px; color: var(--muted); }
+    .chip { display: inline-block; padding: 2px 6px; border-radius: 4px; margin-right: 4px; background: #1e293b; color: var(--accent); font-weight: 700; }
+    .warn { color: var(--warn); }
+    .nowrap { white-space: nowrap; }
+    input[type="range"] { width: 100%; }
+    .flex-between { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  </style>
+</head>
+<body>
+  <header>CA-Enc-Sys Trace Viewer</header>
+  <main>
+    <div class="panel">
+      <div class="row">
+        <div class="col">
+          <label>Trace source (JSONL from main -t &lt;file&gt;)</label>
+          <input type="file" id="fileInput" accept=".jsonl,.txt">
+        </div>
+        <div class="col">
+          <label>&nbsp;</label>
+          <button id="loadSample">Load trace.jsonl from this folder</button>
+        </div>
+      </div>
+      <div id="loadStatus" class="small" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="panel">
+      <div class="row">
+        <div class="col">
+          <label>Chunk</label>
+          <select id="chunkSelect"></select>
+        </div>
+        <div class="col">
+          <label>Simulator</label>
+          <select id="simSelect">
+            <option value="single">single</option>
+            <option value="pipeline">pipeline</option>
+          </select>
+        </div>
+        <div class="col">
+          <label>Cycle</label>
+          <div class="flex-between">
+            <input type="range" min="0" max="0" value="0" id="cycleSlider">
+            <div class="nowrap small" id="cycleLabel">0 / 0</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="metrics" id="summaryMetrics"></div>
+    </div>
+
+    <div class="panel">
+      <div class="flex-between">
+        <h3 style="margin:0;">Cycle Detail</h3>
+        <div id="pcLabel" class="small"></div>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Stage</th><th>Opcode</th><th>Details</th></tr>
+        </thead>
+        <tbody id="stageTable"></tbody>
+      </table>
+      <div id="effects" class="small" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="panel">
+      <h3 style="margin:0 0 8px 0;">Timeline (IF stage)</h3>
+      <div id="timeline" class="small" style="max-height:240px; overflow:auto; font-family:monospace; white-space:nowrap;"></div>
+    </div>
+  </main>
+
+  <script>
+    const fileInput = document.getElementById('fileInput');
+    const loadStatus = document.getElementById('loadStatus');
+    const chunkSelect = document.getElementById('chunkSelect');
+    const simSelect = document.getElementById('simSelect');
+    const cycleSlider = document.getElementById('cycleSlider');
+    const cycleLabel = document.getElementById('cycleLabel');
+    const stageTable = document.getElementById('stageTable');
+    const effects = document.getElementById('effects');
+    const summaryMetrics = document.getElementById('summaryMetrics');
+    const timeline = document.getElementById('timeline');
+    const pcLabel = document.getElementById('pcLabel');
+
+    let traces = [];
+    let grouped = {};
+
+    fileInput.addEventListener('change', async (e) => {
+      if (!e.target.files.length) return;
+      const text = await e.target.files[0].text();
+      parseTrace(text, `Loaded ${e.target.files[0].name}`);
+    });
+
+    document.getElementById('loadSample').addEventListener('click', async () => {
+      try {
+        const res = await fetch('trace.jsonl');
+        if (!res.ok) throw new Error('fetch failed');
+        const text = await res.text();
+        parseTrace(text, 'Loaded trace.jsonl from repo');
+      } catch (err) {
+        loadStatus.textContent = 'Could not load trace.jsonl (place it beside this HTML or use file picker).';
+      }
+    });
+
+    function parseTrace(text, status) {
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      traces = [];
+      for (const line of lines) {
+        try { traces.push(JSON.parse(line)); }
+        catch (err) { console.warn('Bad line', line); }
+      }
+      grouped = {};
+      for (const t of traces) {
+        const key = `${t.sim}|${t.chunk}`;
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(t);
+      }
+      for (const key of Object.keys(grouped)) {
+        grouped[key].sort((a,b) => a.cycle - b.cycle);
+      }
+      populateSelectors();
+      loadStatus.textContent = status + ` (${traces.length} entries)`;
+    }
+
+    function populateSelectors() {
+      const chunks = [...new Set(traces.map(t => t.chunk))].sort((a,b)=>a-b);
+      chunkSelect.innerHTML = chunks.map(c => `<option value="${c}">Chunk ${c}</option>`).join('');
+      chunkSelect.value = chunks[0] ?? 0;
+      simSelect.value = 'pipeline';
+      updateCycleRange();
+      updateSummary();
+      render();
+    }
+
+    function updateCycleRange() {
+      const key = `${simSelect.value}|${chunkSelect.value}`;
+      const arr = grouped[key] || [];
+      const maxCycle = arr.length ? arr[arr.length-1].cycle : 0;
+      cycleSlider.min = 0;
+      cycleSlider.max = maxCycle;
+      cycleSlider.value = 0;
+      cycleLabel.textContent = `0 / ${maxCycle}`;
+    }
+
+    chunkSelect.addEventListener('change', () => { updateCycleRange(); render(); updateSummary(); });
+    simSelect.addEventListener('change', () => { updateCycleRange(); render(); updateSummary(); });
+    cycleSlider.addEventListener('input', () => { render(); });
+
+    function currentTrace() {
+      const key = `${simSelect.value}|${chunkSelect.value}`;
+      const arr = grouped[key] || [];
+      const cy = Number(cycleSlider.value);
+      cycleLabel.textContent = `${cy} / ${cycleSlider.max}`;
+      const t = arr.find(x => x.cycle === cy) || null;
+      return { trace: t, arr };
+    }
+
+    function render() {
+      const { trace, arr } = currentTrace();
+      stageTable.innerHTML = '';
+      effects.textContent = '';
+      pcLabel.textContent = trace ? `PC=${trace.pc}  t=${trace.t !== undefined ? trace.t.toFixed(3)+' ns' : ''}` : '';
+      if (!trace) return;
+
+      const rows = [
+        ['IF', trace.if, ''],
+        ['ID', trace.id, ''],
+        ['EX', trace.ex, ''],
+        ['MEM', trace.mem, ''],
+        ['WB', trace.wb, '']
+      ];
+      for (const [stage, opc, detail] of rows) {
+        const tr = document.createElement('tr');
+        tr.className = 'stage-row';
+        tr.innerHTML = `<td>${stage}</td><td><span class="chip">${opc}</span></td><td>${detail || ''}</td>`;
+        stageTable.appendChild(tr);
+      }
+
+      const parts = [];
+      if (trace.mem && trace.mem.op) {
+        parts.push(`mem: ${trace.mem.op} ea=${trace.mem.ea} before=${trace.mem.before}${trace.mem.after!==undefined?` after=${trace.mem.after}`:''}${trace.mem.val!==undefined?` val=${trace.mem.val}`:''}`);
+      }
+      if (trace.wb && trace.wb.dest) {
+        parts.push(`wb: ${trace.wb.dest}=${trace.wb.val}`);
+      }
+      effects.textContent = parts.join(' | ');
+
+      // timeline of IF stage for context
+      const span = 40;
+      const cur = Number(cycleSlider.value);
+      const start = Math.max(0, cur - span);
+      const end = Math.min(cur + span, arr.length ? arr[arr.length-1].cycle : cur);
+      let line = '';
+      for (let c = start; c <= end; c++) {
+        const t = arr.find(x => x.cycle === c);
+        const opc = t ? t.if : '-';
+        line += (c === cur ? `[${opc}]` : ` ${opc} `);
+      }
+      timeline.textContent = `cycles ${start}..${end}: ${line}`;
+    }
+
+    function updateSummary() {
+      const { arr } = currentTrace();
+      const cycles = arr.length ? arr[arr.length - 1].cycle + 1 : 0;
+      const retired = arr.filter(t => t.wb && t.wb.dest).length;
+      const memOps = arr.filter(t => t.mem && t.mem.op);
+      const loads = memOps.filter(m => m.mem.op === 'LD' || m.mem.op === 'LDK').length;
+      const stores = memOps.filter(m => m.mem.op === 'ST').length;
+      const lastT = arr.length ? (arr[arr.length - 1].t ?? 0) : 0;
+
+      let clock = 0;
+      for (let i = 1; i < arr.length; i++) {
+        const dt = (arr[i].t ?? 0) - (arr[i - 1].t ?? 0);
+        if (dt > 0) { clock = dt; break; }
+      }
+      if (clock === 0 && arr.length > 1) {
+        const lastCycle = arr[arr.length - 1].cycle || 1;
+        clock = lastCycle ? lastT / lastCycle : 0;
+      }
+
+      summaryMetrics.innerHTML = `
+        <div class="metric"><div class="label">Cycles</div><div class="value">${cycles}</div></div>
+        <div class="metric"><div class="label">Clock (ns)</div><div class="value">${clock.toFixed(3)}</div></div>
+        <div class="metric"><div class="label">Time (ns)</div><div class="value">${lastT.toFixed(3)}</div></div>
+        <div class="metric"><div class="label">WB events</div><div class="value">${retired}</div></div>
+        <div class="metric"><div class="label">Loads</div><div class="value">${loads}</div></div>
+        <div class="metric"><div class="label">Stores</div><div class="value">${stores}</div></div>
+      `;
+    }
+
+  </script>
+</body>
+</html>

@@ -12,12 +12,15 @@ typedef enum {
     OPC_ENC  = 0x4,
     OPC_DEC  = 0x5,
     OPC_BNE  = 0x6,
+    OPC_HLT  = 0x7,
     OPC_NOP  = 0xF
 } Opcode;
 
 #define NUM_REGS       8
 #define INSTR_MEM_SIZE 256
 #define DATA_MEM_SIZE  1024
+// Base index in data_mem where plaintext starts (words)
+#define PLAIN_BASE     2
 
 typedef struct {
     uint16_t R[NUM_REGS];

@@ -2,8 +2,8 @@
 #include "isa.h"
 #include "memory.h"
 #include "crypto.h"
+extern int program_size;
 
-// Initialise CPU registers
 void init_cpu(CpuState *cpu) {
     cpu->PC = 0;
     cpu->K0 = 0;
@@ -13,96 +13,77 @@ void init_cpu(CpuState *cpu) {
     }
 }
 
-// Decode 16-bit instruction into fields
 DecodedInstr decode(uint16_t raw) {
     DecodedInstr d;
     d.raw    = raw;
     d.opcode = (raw >> 12) & 0xF;
-    d.f1     = (raw >> 9) & 0x7;   // bits 11-9
-    d.f2     = (raw >> 6) & 0x7;   // bits 8-6
-    d.f3     = (raw >> 3) & 0x7;   // bits 5-3
-
-    uint8_t imm6 = raw & 0x3F;     // bits 5-0
-    if (imm6 & 0x20) {
-        // sign-extend 6-bit -> 8-bit then to int8
-        d.imm6 = (int8_t)(imm6 | 0xC0);
-    } else {
-        d.imm6 = (int8_t)imm6;
-    }
+    d.f1     = (raw >> 9) & 0x7;
+    d.f2     = (raw >> 6) & 0x7;
+    d.f3     = (raw >> 3) & 0x7;
+    uint8_t imm6 = raw & 0x3F;
+    d.imm6 = (imm6 & 0x20) ? (int8_t)(imm6 | 0xC0) : (int8_t)imm6;
     return d;
 }
 
-// Execute one instruction (single-cycle model)
+static int check_ea(uint16_t ea, const char *op) {
+    if (ea >= DATA_MEM_SIZE) {
+        fprintf(stderr, "Memory OOB in %s: EA=0x%04X (limit %d)\n", op, ea, DATA_MEM_SIZE);
+        return 0;
+    }
+    return 1;
+}
+
 void step_single(CpuState *cpu) {
+    if (cpu->PC >= INSTR_MEM_SIZE || cpu->PC >= program_size) {
+        cpu->PC = INSTR_MEM_SIZE;
+        return;
+    }
+
     uint16_t raw = instr_mem[cpu->PC];
     DecodedInstr d = decode(raw);
 
-    // default PC = PC + 1 (may change for branch)
     cpu->PC++;
 
     switch (d.opcode) {
-
-    case OPC_LD: {
-        uint8_t rt = d.f1;
-        uint8_t rs = d.f2;
-        uint16_t ea = (uint16_t)(cpu->R[rs] + d.imm6);
-        cpu->R[rt] = data_mem[ea];
-        break;
-    }
-
-    case OPC_ST: {
-        uint8_t rt = d.f1;
-        uint8_t rs = d.f2;
-        uint16_t ea = (uint16_t)(cpu->R[rs] + d.imm6);
-        data_mem[ea] = cpu->R[rt];
-        break;
-    }
-
-    case OPC_ADDI: {
-        uint8_t rt = d.f1;
-        uint8_t rs = d.f2;
-        cpu->R[rt] = (uint16_t)(cpu->R[rs] + d.imm6);
-        break;
-    }
-
-    case OPC_LDK: {
-        uint8_t rt = d.f1;  // 6 -> K0, 7 -> K1
-        uint8_t rs = d.f2;
-        uint16_t ea = (uint16_t)(cpu->R[rs] + d.imm6);
-        uint16_t key_val = data_mem[ea];
-        if (rt == 6) cpu->K0 = key_val;
-        else if (rt == 7) cpu->K1 = key_val;
-        break;
-    }
-
-    case OPC_ENC: {
-        uint8_t rd = d.f1;
-        uint8_t rs = d.f2;
-        uint16_t in = cpu->R[rs];
-        cpu->R[rd] = enc_func(in, cpu->K0, cpu->K1);
-        break;
-    }
-
-    case OPC_DEC: {
-        uint8_t rd = d.f1;
-        uint8_t rs = d.f2;
-        uint16_t in = cpu->R[rs];
-        cpu->R[rd] = dec_func(in, cpu->K0, cpu->K1);
-        break;
-    }
-
-    case OPC_BNE: {
-        uint8_t rs1 = d.f1;
-        uint8_t rs2 = d.f2;
-        if (cpu->R[rs1] != cpu->R[rs2]) {
-            cpu->PC = (uint16_t)(cpu->PC + d.imm6);
+        case OPC_LD: {
+            uint16_t ea = (uint16_t)(cpu->R[d.f2] + d.imm6);
+            if (!check_ea(ea, "LD")) { cpu->PC = INSTR_MEM_SIZE; return; }
+            cpu->R[d.f1] = data_mem[ea];
+            break;
         }
-        break;
-    }
-
-    case OPC_NOP:
-    default:
-        // do nothing
-        break;
+        case OPC_ST: {
+            uint16_t ea = (uint16_t)(cpu->R[d.f2] + d.imm6);
+            if (!check_ea(ea, "ST")) { cpu->PC = INSTR_MEM_SIZE; return; }
+            data_mem[ea] = cpu->R[d.f1];
+            break;
+        }
+        case OPC_ADDI:
+            cpu->R[d.f1] = (uint16_t)(cpu->R[d.f2] + d.imm6);
+            break;
+        case OPC_LDK: {
+            uint16_t ea = (uint16_t)(cpu->R[d.f2] + d.imm6);
+            if (!check_ea(ea, "LDK")) { cpu->PC = INSTR_MEM_SIZE; return; }
+            uint16_t key_val = data_mem[ea];
+            if (d.f1 == 6) cpu->K0 = key_val;
+            else if (d.f1 == 7) cpu->K1 = key_val;
+            break;
+        }
+        case OPC_ENC:
+            cpu->R[d.f1] = enc_func(cpu->R[d.f2], cpu->K0, cpu->K1);
+            break;
+        case OPC_DEC:
+            cpu->R[d.f1] = dec_func(cpu->R[d.f2], cpu->K0, cpu->K1);
+            break;
+        case OPC_BNE:
+            if (cpu->R[d.f1] != cpu->R[d.f2]) {
+                cpu->PC = (uint16_t)(cpu->PC + d.imm6); // PC already incremented (PC+1 semantics)
+            }
+            break;
+        case OPC_HLT:
+            cpu->PC = INSTR_MEM_SIZE;
+            return;
+        case OPC_NOP:
+        default:
+            break;
     }
 }
